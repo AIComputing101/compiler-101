@@ -60,3 +60,10 @@ cmin
 temp.s
 output
 output.s
+
+# IDE specific files
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
