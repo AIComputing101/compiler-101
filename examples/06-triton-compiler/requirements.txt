@@ -1,0 +1,23 @@
+# Requirements for Triton Compiler Examples
+# Module 6: Triton Compiler – Simplifying High-Performance GPU Programming
+
+# Core dependencies
+torch>=2.0.0          # PyTorch with CUDA support
+triton>=2.1.0         # Triton compiler
+
+# Note: Install PyTorch with CUDA support using one of these commands:
+#
+# For NVIDIA GPUs (CUDA 11.8):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu118
+#
+# For NVIDIA GPUs (CUDA 12.1):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# For AMD GPUs (ROCm 5.7):
+#   pip install torch --index-url https://download.pytorch.org/whl/rocm5.7
+#
+# Then install remaining dependencies:
+#   pip install triton
+
+# Optional dependencies for enhanced functionality
+numpy>=1.20.0         # Numerical operations (usually installed with PyTorch)

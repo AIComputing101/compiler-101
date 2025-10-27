@@ -301,3 +301,144 @@ Figure: Python Frontend + JIT + Automatic GPU Optimization
                  ↓ "GPU-Accelerated ML"
 [ML Workload (e.g., Transformer Inference)]  ← Output (Oval)
 ```
+
+
+## 6.8 Contributing to the Triton Compiler (case study) 
+
+This section walks through a practical, upstream-ready contribution to Triton: reducing shared-memory (LDS) bank conflicts for matrix multiplication (matmul) on AMD GPUs. It illustrates the full contributor workflow—profiling, designing an optimization, implementing it cleanly, validating it, and preparing a high‑quality PR.
+
+
+### 6.8.1 Scenario: Improve matmul on AMD by reducing LDS bank conflicts
+On AMD GPUs, shared memory (LDS) is divided into 32 banks. When many threads in a wavefront access addresses that map to the same bank, requests serialize and throughput drops. Triton’s tiled matmul (via `tl.dot`) relies on LDS; for some tile sizes (e.g., 16×16), access patterns can align poorly and trigger frequent bank conflicts.
+
+Goal: adjust tiling to minimize conflicts on AMD—boosting throughput without hurting NVIDIA performance.
+
+
+### 6.8.2 Step 1 — Identify the problem (profiling and benchmarking)
+- Set up Triton in editable mode and prepare benchmarking tools.
+- On AMD (ROCm), use `rocprof` to measure LDS bank conflict metrics while running matmul benchmarks.
+
+Commands (example):
+
+```bash
+# Install Triton from source for dev
+git clone https://github.com/openai/triton.git
+cd triton
+pip install -e ".[tests,benchmark]"
+
+# Profile a matmul benchmark on AMD
+rocprof --stats ./benchmarks/bench_matmul.py
+```
+
+What to look for: high "LDS Bank Conflict" counts with 16×16 tiles indicate the issue.
+
+
+### 6.8.3 Step 2 — Design the optimization (padding to break alignment)
+- AMD LDS has 32 banks, 4 bytes each → 32×4 = 128 bytes per bank cycle.
+- If adjacent threads access addresses separated by multiples of 128 bytes, they collide on the same bank.
+- Add a small padding column to shared tiles to shift addresses and de-align accesses.
+
+Design choices:
+- Keep logical tile size (e.g., 16×16) but allocate shared tiles as 16×17 (i.e., +1 column) on AMD.
+- Gate the padding via a compile-time flag or target detection so NVIDIA remains unchanged.
+
+
+### 6.8.4 Step 3 — Implement the optimization (kernel + IR hook)
+In the Triton matmul kernel, conditionally allocate padded shared-memory tiles on AMD and adjust indices accordingly. Conceptually:
+
+```python
+import triton
+import triton.language as tl
+
+@triton.jit
+def optimized_matmul(
+    A_ptr, B_ptr, C_ptr,
+    M, N, K,
+    A_stride, B_stride, C_stride,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    AMD_PAD: tl.constexpr = False  # Enable padding for AMD
+):
+    # Allocate shared tiles (add +1 col when AMD_PAD is enabled)
+    if AMD_PAD:
+        sA = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K + 1), dtype=tl.float32)
+        sB = tl.zeros((BLOCK_SIZE_K + 1, BLOCK_SIZE_N), dtype=tl.float32)
+    else:
+        sA = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
+        sB = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.float32)
+
+    # ... load tiles A/B into sA/sB, tl.sync(), tl.dot on the logical K span, store C ...
+```
+
+If you need IR-level control, add a small hook in the shared-memory allocator to conditionally pad 2D shapes when targeting AMD:
+
+```python
+# Pseudocode in Triton codegen
+def allocate_shared(shape, dtype, amd_pad=False):
+    if amd_pad and len(shape) == 2:
+        shape = (shape[0], shape[1] + 1)
+    return lower_to_backend_shared_alloc(shape, dtype)
+```
+
+Key requirements:
+- Keep the logical math on K unchanged; only the physical LDS layout gets a padding column.
+- Ensure index math skips the padding column during loads/compute/stores.
+- Guard behind a flag or target check to avoid regressions on NVIDIA.
+
+
+### 6.8.5 Step 4 — Validate correctness and measure performance
+1) Unit tests: verify numerical equivalence vs. PyTorch.
+
+```python
+import torch
+import triton
+
+def test_optimized_matmul_amd():
+    for M, N, K in [(16, 16, 16), (1024, 1024, 1024)]:
+        A = torch.randn(M, K, device='cuda', dtype=torch.float32)
+        B = torch.randn(K, N, device='cuda', dtype=torch.float32)
+        # Call your AMD-padded matmul kernel
+        C_triton = /* launch optimized_matmul with AMD_PAD=True */
+        C_torch = A @ B
+        assert torch.allclose(C_triton, C_torch, atol=1e-3)
+```
+
+2) Benchmarks: compare baseline vs. padded tiles on AMD (e.g., MI250). Measure GFLOP/s across sizes like 1024, 2048, 4096.
+
+Expected result: substantial drop in "LDS Bank Conflict" counters and ~15–20% throughput gains for large matrices on AMD when padding is enabled, with no regressions on NVIDIA (padding off).
+
+
+### 6.8.6 Step 5 — Prepare a quality PR
+- Open an issue summarizing the problem, design, and early data.
+- Submit a PR with:
+  - Kernel/IR changes guarded behind a clearly documented flag/target check.
+  - Unit tests and a benchmark script.
+  - Brief docs explaining padding and when/why it helps.
+- Address feedback (e.g., tune tile sizes for other AMD cards, verify NVIDIA parity, consider auto-detection).
+
+
+### 6.8.7 Try it in this repo
+This course repo includes Triton examples in `examples/06-triton-compiler/`. To experiment locally:
+
+```bash
+# (Optional) use a virtual environment
+python -m venv .venv && source .venv/bin/activate
+
+# Install Python deps for the examples
+pip install -r examples/06-triton-compiler/requirements.txt
+
+# Quick sanity checks and benchmarks (NVIDIA or AMD, where supported)
+python examples/06-triton-compiler/01_vector_addition.py
+python examples/06-triton-compiler/02_matrix_multiplication.py
+python examples/06-triton-compiler/benchmark_all.py
+```
+
+If you’re developing the AMD padding idea, start from `02_matrix_multiplication.py`, prototype a padded tile, and compare timings. You can then port the idea to upstream Triton following the steps above.
+
+
+### 6.8.8 Takeaways for impactful Triton contributions
+- Focus on ML-critical ops (matmul, attention, softmax, layernorm).
+- Use vendor profilers (`nsys`, `nvprof`, `rocprof`) to identify real bottlenecks.
+- Design optimizations that are guarded or adaptive to avoid cross‑vendor regressions.
+- Ship tests, benchmarks, and docs with your PR to ease review and ensure longevity.
